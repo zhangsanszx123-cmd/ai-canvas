@@ -1,11 +1,10 @@
-import { UpdatePasswordForm } from "@/components/update-password-form";
-
-export default function Page() {
+import { AuthForm } from "@/components/canvas/auth-form";
+import { Suspense } from "react";
+import { RouteLoading } from "@/components/canvas/route-loading";
+export default function ResetPage() {
   return (
-    <div className="flex min-h-svh w-full items-center justify-center p-6 md:p-10">
-      <div className="w-full max-w-sm">
-        <UpdatePasswordForm />
-      </div>
-    </div>
+    <Suspense fallback={<RouteLoading />}>
+      <AuthForm mode="reset" mailConfigured />
+    </Suspense>
   );
 }
