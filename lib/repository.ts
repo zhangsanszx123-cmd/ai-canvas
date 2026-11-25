@@ -27,7 +27,7 @@ export async function transaction<T>(fn: (db: PoolClient) => Promise<T>) {
 }
 export async function projectFor(owner: string, id: string) {
   const { rows } = await getDb().query(
-    "SELECT * FROM ac_projects WHERE id=$1 AND owner_id=$2",
+    "SELECT * FROM ac_projects WHERE id=$1 AND owner_id=$2 AND deleted_at IS NULL",
     [id, owner],
   );
   if (!rows[0]) throw new HttpError(404, "项目不存在");
@@ -51,6 +51,11 @@ export async function enqueue(
   if (!/^[\w-]{8,128}$/.test(key))
     throw new HttpError(422, "缺少有效的请求标识");
   await db.query("SELECT pg_advisory_xact_lock(hashtext($1))", [owner]);
+  const allowedProject = await db.query(
+    "SELECT id FROM ac_projects WHERE id=$1 AND owner_id=$2 AND deleted_at IS NULL FOR UPDATE",
+    [project, owner],
+  );
+  if (!allowedProject.rowCount) throw new HttpError(404, "项目不存在");
   const hash = createHash("sha256")
     .update(JSON.stringify({ project, ...input }))
     .digest("hex");

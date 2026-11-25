@@ -24,6 +24,43 @@ type Run = {
   attachmentIds: string[];
   events: Event[];
 };
+function toolStatus(events: Event[], start?: Event) {
+  const endIndex = events.findIndex(
+    (e) =>
+      e.type === "tool_execution_end" && e.toolCallId === start?.toolCallId,
+  );
+  if (endIndex < 0) return "执行中";
+  const end = events[endIndex];
+  if (start?.toolName !== "generate_image")
+    return end.isError ? "失败" : "完成";
+  if (end.isError) {
+    const retried = events
+      .slice(endIndex + 1)
+      .some(
+        (e) =>
+          e.type === "tool_execution_end" &&
+          !e.isError &&
+          typeof e.result === "object" &&
+          e.result !== null &&
+          "taskId" in e.result,
+      );
+    const parameterError = /图片比例|图片尺寸|config/.test(end.error || "");
+    return retried
+      ? parameterError
+        ? "参数未通过，后续重试已提交"
+        : "调用失败，后续重试已提交"
+      : parameterError
+        ? "参数未通过（未提交生图）"
+        : "提交失败";
+  }
+  const result = end.result as
+    { taskIds?: string[]; taskId?: string } | undefined;
+  return result?.taskIds?.length
+    ? `已提交 ${result.taskIds.length} 张`
+    : result?.taskId
+      ? "已提交"
+      : "调用完成";
+}
 export function useAgentConversation(
   projectId: string,
   refresh: () => Promise<void>,
@@ -215,20 +252,7 @@ export function AgentMessages({
                     read_canvas: "读取画布",
                   } as Record<string, string>
                 )[block.event?.toolName || ""] || block.event?.toolName}{" "}
-                ·{" "}
-                {run.events.find(
-                  (e) =>
-                    e.type === "tool_execution_end" &&
-                    e.toolCallId === block.event?.toolCallId,
-                )?.isError
-                  ? "失败"
-                  : run.events.some(
-                        (e) =>
-                          e.type === "tool_execution_end" &&
-                          e.toolCallId === block.event?.toolCallId,
-                      )
-                    ? "完成"
-                    : "执行中"}
+                · {toolStatus(run.events, block.event)}
               </summary>
               <pre>
                 {JSON.stringify(

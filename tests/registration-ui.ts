@@ -516,6 +516,8 @@ async function main() {
     console.log("PASS malformed project ID shows not-found UI");
     await page.goto(`${base}/protected`);
     await page.getByRole("button", { name: "退出登录" }).click();
+    await expect(page).toHaveURL(`${base}/`);
+    await page.getByRole("link", { name: "登录", exact: true }).click();
     await expect(page).toHaveURL(`${base}/auth/login`);
     await page.getByRole("link", { name: "忘记密码？" }).click();
     await expect(page.getByRole("heading", { name: "找回密码" })).toBeVisible();

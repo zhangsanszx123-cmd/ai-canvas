@@ -3,7 +3,7 @@ import { z } from "zod";
 import { getDb } from "@/lib/db";
 import { requireUser } from "@/lib/session";
 import { checkOrigin, respond, HttpError, uuid } from "@/lib/http";
-import { configSchema, generationSchema } from "@/lib/models";
+import { activeStates, configSchema, generationSchema } from "@/lib/models";
 import {
   createProject,
   projectFor,
@@ -20,12 +20,17 @@ import {
 } from "@/lib/storage";
 import { mailReady } from "@/lib/mail";
 import { agentInput, runAgent } from "@/lib/agent";
-import { parseSkill, skillFor } from "@/lib/skills";
+import { skillFor, skillUpload } from "@/lib/skills";
+
+import { listProjects } from "@/lib/project-list";
+import { publicProject, publicAssetUrl } from "@/lib/public-projects";
+import { enqueueImageAction } from "@/lib/image-action-jobs";
 
 type Context = { params: Promise<{ path: string[] }> };
 function publicTask(row: Record<string, unknown>) {
   return {
     id: row.id,
+    imageAction: row.image_action || null,
     projectId: row.project_id,
     prompt: row.prompt,
     referenceAssetId: row.reference_asset_id,
@@ -52,6 +57,22 @@ async function dispatch(request: Request, context: Context) {
   if (method === "GET" && path.join("/") === "config")
     return { mailReady: mailReady() };
   if (method !== "GET") checkOrigin(request);
+  if (method === "GET" && path[0] === "public") {
+    if (path[1] === "projects" && path.length === 2)
+      return listProjects(null, url.searchParams);
+    if (path[1] === "projects" && path.length === 3)
+      return publicProject(uuid(path[2]));
+    if (path[1] === "assets" && path.length === 4 && path[3] === "content")
+      return NextResponse.redirect(
+        await publicAssetUrl(
+          uuid(path[2]),
+          url.searchParams.get("download") === "1",
+          url.searchParams.get("preview") === "1",
+        ),
+        { status: 307, headers: { "Cache-Control": "no-store" } },
+      );
+    throw new HttpError(404, "接口不存在");
+  }
   const user = await requireUser();
   const owner = user.id;
   if (method !== "GET") await rateLimit(`${owner}:writes`, 60);
@@ -77,6 +98,51 @@ async function dispatch(request: Request, context: Context) {
       headers: request.headers,
       body: new Uint8Array(Buffer.concat(chunks)),
     });
+  }
+  if (path[0] === "skills") {
+    if (path.length === 1 && method === "GET")
+      return {
+        items: (
+          await db.query(
+            "SELECT id,name,description,'account' AS scope FROM ac_skills WHERE owner_id=$1 AND project_id IS NULL ORDER BY created_at DESC,id DESC",
+            [owner],
+          )
+        ).rows,
+      };
+    if (path.length === 1 && method === "POST") {
+      const skill = await skillUpload(request);
+      const saved = await db.query(
+        "INSERT INTO ac_skills(id,owner_id,name,description,source,body) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(owner_id,name) WHERE project_id IS NULL DO NOTHING RETURNING id,name,description,'account' AS scope",
+        [
+          crypto.randomUUID(),
+          owner,
+          skill.name,
+          skill.description,
+          skill.source,
+          skill.body,
+        ],
+      );
+      if (!saved.rowCount)
+        throw new HttpError(409, "技能库已存在同名技能，请先移除旧版");
+      return saved.rows[0];
+    }
+    if (path.length === 2 && method === "GET") {
+      const { rows } = await db.query(
+        "SELECT id,name,description,body,source,'account' AS scope FROM ac_skills WHERE id=$1 AND owner_id=$2 AND project_id IS NULL",
+        [uuid(path[1]), owner],
+      );
+      if (!rows[0]) throw new HttpError(404, "技能不存在");
+      return rows[0];
+    }
+    if (path.length === 2 && method === "DELETE") {
+      const removed = await db.query(
+        "DELETE FROM ac_skills WHERE id=$1 AND owner_id=$2 AND project_id IS NULL RETURNING id",
+        [uuid(path[1]), owner],
+      );
+      if (!removed.rowCount) throw new HttpError(404, "技能不存在");
+      return { ok: true };
+    }
+    throw new HttpError(404, "接口不存在");
   }
   if (method === "POST" && path[0] === "uploads" && path.length === 1) {
     if (Number(request.headers.get("content-length")) > 10_100_000)
@@ -116,6 +182,7 @@ async function dispatch(request: Request, context: Context) {
           owner,
           3600,
           url.searchParams.get("download") === "1",
+          url.searchParams.get("preview") === "1",
         ),
         { status: 307, headers: { "Cache-Control": "private, no-store" } },
       );
@@ -136,88 +203,62 @@ async function dispatch(request: Request, context: Context) {
         request.headers.get("idempotency-key") || undefined,
       );
     }
-    if (method === "GET") {
-      const limit = Math.min(
-        20,
-        Math.max(1, Number(url.searchParams.get("limit")) || 20),
-      );
-      let cursor: { time: string; id: string } | null = null;
-      if (url.searchParams.get("cursor")) {
-        try {
-          cursor = JSON.parse(
-            Buffer.from(
-              url.searchParams.get("cursor")!,
-              "base64url",
-            ).toString(),
-          );
-          if (
-            !cursor?.time ||
-            !cursor.id ||
-            Number.isNaN(Date.parse(cursor.time))
-          )
-            throw new Error();
-          uuid(cursor.id);
-        } catch {
-          throw new HttpError(422, "分页参数无效");
-        }
-      }
-      const { rows } = await db.query(
-        "SELECT id,name,cover_asset_id,created_at,updated_at FROM ac_projects WHERE owner_id=$1 AND ($2::timestamptz IS NULL OR (updated_at,id)<($2::timestamptz,$3::uuid)) ORDER BY updated_at DESC,id DESC LIMIT $4",
-        [owner, cursor?.time || null, cursor?.id || null, limit + 1],
-      );
-      const more = rows.length > limit;
-      const items = rows.slice(0, limit).map((r) => ({
-        ...r,
-        coverUrl: r.cover_asset_id
-          ? `/api/assets/${r.cover_asset_id}/content`
-          : null,
-      }));
-      const last = items.at(-1);
-      return {
-        items,
-        nextCursor:
-          more && last
-            ? Buffer.from(
-                JSON.stringify({
-                  time: last.updated_at.toISOString(),
-                  id: last.id,
-                }),
-              ).toString("base64url")
-            : null,
-      };
-    }
+    if (method === "GET") return listProjects(owner, url.searchParams);
   }
   if (path[0] === "projects" && path[1]) {
     const id = uuid(path[1]);
     const project = await projectFor(owner, id);
+    if (path.length === 2 && method === "DELETE")
+      return transaction(async (tx) => {
+        await tx.query("SELECT pg_advisory_xact_lock(hashtext($1))", [owner]);
+        const current = await tx.query(
+          "SELECT id,agent_lease_until>now() AS agent_busy FROM ac_projects WHERE id=$1 AND owner_id=$2 AND deleted_at IS NULL FOR UPDATE",
+          [id, owner],
+        );
+        if (!current.rowCount) throw new HttpError(404, "项目不存在");
+        const active = await tx.query(
+          "SELECT 1 FROM ac_tasks WHERE project_id=$1 AND owner_id=$2 AND status=ANY($3::text[]) LIMIT 1",
+          [id, owner, activeStates],
+        );
+        if (current.rows[0].agent_busy || active.rowCount)
+          throw new HttpError(409, "项目正在处理任务，请等待完成后再删除");
+        await tx.query(
+          "UPDATE ac_projects SET deleted_at=now(),updated_at=now() WHERE id=$1 AND owner_id=$2",
+          [id, owner],
+        );
+        return { ok: true };
+      });
     if (path[2] === "skills") {
+      if (path.length === 5 && path[4] === "library" && method === "POST") {
+        const saved = await db.query(
+          "INSERT INTO ac_skills(id,owner_id,name,description,source,body) SELECT $1,owner_id,name,description,source,body FROM ac_skills WHERE id=$2 AND owner_id=$3 AND project_id=$4 ON CONFLICT(owner_id,name) WHERE project_id IS NULL DO NOTHING RETURNING id,name,description,'account' AS scope",
+          [crypto.randomUUID(), uuid(path[3]), owner, id],
+        );
+        if (!saved.rowCount) {
+          const existing = await db.query(
+            "SELECT id FROM ac_skills WHERE id=$1 AND owner_id=$2 AND project_id=$3",
+            [uuid(path[3]), owner, id],
+          );
+          throw new HttpError(
+            existing.rowCount ? 409 : 404,
+            existing.rowCount ? "账号技能库已有同名技能" : "项目技能不存在",
+          );
+        }
+        return saved.rows[0];
+      }
       if (path.length === 3 && method === "GET")
         return {
           items: (
             await db.query(
-              "SELECT id,name,description,created_at FROM ac_skills WHERE owner_id=$1 AND project_id=$2 ORDER BY created_at DESC",
+              "SELECT id,name,description,created_at,CASE WHEN project_id IS NULL THEN 'account' ELSE 'project' END AS scope FROM ac_skills WHERE owner_id=$1 AND (project_id=$2 OR project_id IS NULL) ORDER BY (project_id IS NULL),created_at DESC",
               [owner, id],
             )
           ).rows,
         };
       if (path.length === 3 && method === "POST") {
-        const form = await request.formData();
-        const file = form.get("file");
-        if (!(file instanceof File) || !/^SKILL\.md$/i.test(file.name))
-          throw new HttpError(422, "请上传标准 SKILL.md 文件");
-        if (file.size > 128000)
-          throw new HttpError(413, "Skill 不能超过 128KB");
-        let text: string;
-        try {
-          text = new TextDecoder("utf-8", { fatal: true }).decode(
-            await file.arrayBuffer(),
-          );
-        } catch {
-          throw new HttpError(422, "Skill 必须为 UTF-8 编码");
-        }
-        const skill = parseSkill(text);
+        const skill = await skillUpload(request);
         const saved = await db.query(
-          "INSERT INTO ac_skills(id,owner_id,project_id,name,description,source,body) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(owner_id,project_id,name) DO NOTHING RETURNING id,name,description",
+          "INSERT INTO ac_skills(id,owner_id,project_id,name,description,source,body) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(owner_id,project_id,name) DO NOTHING RETURNING id,name,description,'project' AS scope",
           [
             crypto.randomUUID(),
             owner,
@@ -236,10 +277,15 @@ async function dispatch(request: Request, context: Context) {
         const skill = await skillFor(owner, id, uuid(path[3]));
         if (method === "GET") return skill;
         if (method === "DELETE") {
-          await db.query(
-            "DELETE FROM ac_skills WHERE id=$1 AND owner_id=$2 AND project_id=$3",
+          const removed = await db.query(
+            "DELETE FROM ac_skills WHERE id=$1 AND owner_id=$2 AND project_id=$3 RETURNING id",
             [skill.id, owner, id],
           );
+          if (!removed.rowCount)
+            throw new HttpError(
+              404,
+              "项目技能不存在；账号技能请在技能库中管理",
+            );
           return { ok: true };
         }
       }
@@ -455,6 +501,23 @@ async function dispatch(request: Request, context: Context) {
         return { version: changed.rows[0].version };
       });
     }
+    if (path.length === 3 && path[2] === "image-actions" && method === "POST") {
+      await rateLimit(`${owner}:generations`, 10);
+      const tasks = await enqueueImageAction(
+        owner,
+        id,
+        await request.json(),
+        request.headers.get("idempotency-key") || "",
+      );
+      const nodes = await db.query(
+        "SELECT n.*,t.status,t.progress,t.error,CASE WHEN n.asset_id IS NOT NULL THEN '/api/assets/'||n.asset_id::text||'/content' ELSE NULL END AS url FROM ac_nodes n JOIN ac_tasks t ON t.id=n.task_id WHERE t.owner_id=$1 AND n.project_id=$2 AND n.task_id=ANY($3::uuid[])",
+        [owner, id, tasks.map((task) => task.id)],
+      );
+      return NextResponse.json(
+        { tasks: tasks.map(publicTask), nodes: nodes.rows },
+        { status: 202, headers: { "Cache-Control": "no-store" } },
+      );
+    }
     if (path[2] === "generations" && method === "POST") {
       await rateLimit(`${owner}:generations`, 10);
       const input = generationSchema.parse(await request.json());
@@ -497,6 +560,7 @@ async function dispatch(request: Request, context: Context) {
     );
     const task = rows[0];
     if (!task) throw new HttpError(404, "任务不存在");
+    await projectFor(owner, task.project_id);
     if (method === "GET") return publicTask(task);
     if (method === "POST" && path[2] === "retry") {
       if (task.status !== "failed")
@@ -510,15 +574,23 @@ async function dispatch(request: Request, context: Context) {
       });
       return NextResponse.json(
         publicTask(
-          await transaction((tx) =>
-            enqueue(
+          await transaction(async (tx) => {
+            const retried = await enqueue(
               tx,
               owner,
               task.project_id,
               input,
               request.headers.get("idempotency-key") || "",
-            ),
-          ),
+            );
+            if (task.image_action && !retried.image_action) {
+              await tx.query(
+                "UPDATE ac_tasks SET image_action=$2 WHERE id=$1",
+                [retried.id, task.image_action],
+              );
+              retried.image_action = task.image_action;
+            }
+            return retried;
+          }),
         ),
         { status: 202, headers: { "Cache-Control": "no-store" } },
       );

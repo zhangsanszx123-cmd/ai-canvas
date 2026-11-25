@@ -1,4 +1,5 @@
 "use client";
+import { imageDisplayUrl } from "@/lib/image-display";
 /* eslint-disable @next/next/no-img-element */
 import { useEffect, useRef, useState } from "react";
 import { api, type Asset } from "@/lib/client-api";
@@ -38,7 +39,11 @@ export function Attachment({
         {markdown ? (
           <span>{asset.filename || "Markdown"}</span>
         ) : (
-          <img src={asset.url} alt={label || "附件图片"} />
+          <img
+            src={imageDisplayUrl(asset.url)}
+            decoding="async"
+            alt={label || "附件图片"}
+          />
         )}
       </button>
       {open && (
@@ -65,7 +70,7 @@ export function Attachment({
           {markdown ? (
             <pre>{text}</pre>
           ) : (
-            <img src={asset.url} alt="附件预览" />
+            <img src={asset.url} decoding="async" alt="附件预览" />
           )}
         </dialog>
       )}

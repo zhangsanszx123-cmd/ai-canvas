@@ -7,9 +7,11 @@ import type { Asset } from "@/lib/client-api";
 export function ImagePreview({
   asset,
   onClose,
+  downloadUrl,
 }: {
   asset: Asset;
   onClose: () => void;
+  downloadUrl?: string;
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const stage = useRef<HTMLDivElement>(null);
@@ -107,7 +109,7 @@ export function ImagePreview({
         <a
           aria-label="下载预览图片"
           title="下载图片"
-          href={`/api/assets/${asset.id}/content?download=1`}
+          href={downloadUrl || `/api/assets/${asset.id}/content?download=1`}
         >
           <Download size={19} />
         </a>

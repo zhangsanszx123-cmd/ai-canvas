@@ -1,5 +1,7 @@
 "use client";
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { imageDisplayUrl } from "@/lib/image-display";
+/* eslint-disable @next/next/no-img-element -- Private attachment thumbnails require session cookies. */
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import {
   ArrowUp,
   Plus,
@@ -10,11 +12,13 @@ import {
   Upload,
   MousePointer2,
   LoaderCircle,
+  BookOpen,
 } from "lucide-react";
 import OpenAI from "@lobehub/icons/es/OpenAI";
 import { Attachment } from "./attachment";
 import { SkillPicker } from "./skill-picker";
 import type { Skill } from "@/lib/client-api";
+import { composerCommand, consumeCommand } from "@/lib/composer-commands";
 import NanoBanana from "@lobehub/icons/es/NanoBanana";
 import {
   DropdownMenu,
@@ -56,6 +60,8 @@ type Props = {
   initialConfig?: ModelConfig;
   busy?: boolean;
   selectedReference?: Asset | null;
+  availableAssets?: Asset[];
+  onRequireLogin?: () => void;
   onChooseCanvas?: () => void;
   onConfig?: (c: ModelConfig) => void;
   onSend: (input: GenerationInput) => Promise<void>;
@@ -75,6 +81,8 @@ export function Composer({
   onSend,
   onConfig,
   selectedReference,
+  availableAssets,
+  onRequireLogin,
   onAgentSend,
   onUpload,
 }: Props) {
@@ -95,6 +103,136 @@ export function Composer({
   const [skillUploading, setSkillUploading] = useState(false);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
+  const [caret, setCaret] = useState(0);
+  const [dismissed, setDismissed] = useState("");
+  const [suggestions, setSuggestions] = useState<{
+    skills: Skill[];
+    assets: Asset[];
+  }>({ skills: [], assets: [] });
+  const [commandLoading, setCommandLoading] = useState(false);
+  const [commandError, setCommandError] = useState("");
+  const [activeOption, setActiveOption] = useState(0);
+  const commandId = useId();
+  const parsedCommand = composerCommand(prompt, caret);
+  const command =
+    !busy &&
+    !sending &&
+    !uploading &&
+    dismissed !== `${prompt}:${caret}` &&
+    (parsedCommand?.kind !== "skill" || mode === "agent")
+      ? parsedCommand
+      : null;
+  const commandKind = command?.kind;
+  useEffect(() => {
+    if (!commandKind) return;
+    if (onRequireLogin) {
+      onRequireLogin();
+      return;
+    }
+    let current = true;
+    setCommandLoading(true);
+    setCommandError("");
+    setSuggestions({ skills: [], assets: [] });
+    const fetchItems = async () => {
+      if (commandKind === "skill")
+        return {
+          skills: (
+            await api<{ items: Skill[] }>(
+              projectId ? `projects/${projectId}/skills` : "skills",
+            )
+          ).items,
+          assets: [],
+        };
+      if (availableAssets) return { skills: [], assets: availableAssets };
+      if (!projectId) return { skills: [], assets: [] };
+      return {
+        skills: [],
+        assets: (await api<{ assets: Asset[] }>(`projects/${projectId}`))
+          .assets,
+      };
+    };
+    void fetchItems()
+      .then((data) => {
+        if (current) setSuggestions(data);
+      })
+      .catch((e) => {
+        if (current) setCommandError((e as Error).message);
+      })
+      .finally(() => {
+        if (current) setCommandLoading(false);
+      });
+    return () => {
+      current = false;
+    };
+  }, [commandKind, projectId, availableAssets, onRequireLogin]);
+  const options: {
+    id: string;
+    name: string;
+    description: string;
+    skill?: Skill;
+    asset?: Asset;
+  }[] = (
+    commandKind === "skill"
+      ? suggestions.skills.map((skill) => ({
+          id: skill.id,
+          name: skill.name,
+          description: `${skill.scope === "account" ? "账号技能" : "项目技能"} · ${skill.description}`,
+          skill,
+        }))
+      : suggestions.assets.map((asset, index) => ({
+          id: asset.id,
+          name: asset.filename || `画布图片 ${index + 1}`,
+          description:
+            asset.mime === "text/markdown"
+              ? "Markdown 附件"
+              : `${asset.width} × ${asset.height}`,
+          asset,
+        }))
+  )
+    .filter((item) =>
+      `${item.name} ${item.description}`
+        .toLowerCase()
+        .includes(command?.query.toLowerCase() || ""),
+    )
+    .slice(0, 10);
+  const activeIndex = Math.min(activeOption, Math.max(0, options.length - 1));
+  useEffect(() => {
+    if (commandKind)
+      document
+        .getElementById(`${commandId}-${activeIndex}`)
+        ?.scrollIntoView({ block: "nearest" });
+  }, [activeIndex, commandKind, commandId]);
+  function selectCommand(item: (typeof options)[number]) {
+    if (!command || busy || sending || uploading || skillUploading) return;
+    if (item.asset) {
+      if (item.asset.bytes > 10000000) {
+        setError("这份素材超过 10MB，无法用作附件");
+        return;
+      }
+      if (
+        !attachments.some((a) => a.id === item.id) &&
+        attachments.length >= 15
+      ) {
+        setError("每条消息最多添加 15 份附件");
+        return;
+      }
+      setAttachments((old) =>
+        old.some((a) => a.id === item.id) ? old : [...old, item.asset!],
+      );
+    }
+    if (item.skill) setSelectedSkill(item.skill);
+    const next = consumeCommand(prompt, command);
+    const position = command.start;
+    setPrompt(next);
+    setCaret(position);
+    setActiveOption(0);
+    setError("");
+    setDismissed(`${next}:${position}`);
+    requestAnimationFrame(() => {
+      textarea.current?.focus();
+      textarea.current?.setSelectionRange(position, position);
+    });
+  }
   const root = useRef<HTMLDivElement>(null);
   const popover = useRef<HTMLDivElement>(null);
   const toolbar = useRef<HTMLDivElement>(null);
@@ -146,15 +284,19 @@ export function Composer({
       setAttachments((old) =>
         old.some((a) => a.id === selectedReference.id)
           ? old
-          : [...old, selectedReference],
+          : old.length >= 15
+            ? old
+            : [...old, selectedReference],
       );
       setError("");
     }
   }, [selectedReference]);
   useEffect(() => {
     const click = (e: PointerEvent) => {
-      if (root.current && !root.current.contains(e.target as Node))
+      if (root.current && !root.current.contains(e.target as Node)) {
         setPanel(null);
+        setDismissed(`${prompt}:${caret}`);
+      }
     };
     const key = (e: KeyboardEvent) => {
       if (e.key === "Escape") setPanel(null);
@@ -165,7 +307,7 @@ export function Composer({
       document.removeEventListener("pointerdown", click);
       document.removeEventListener("keydown", key);
     };
-  }, []);
+  }, [prompt, caret]);
   function update(next: ModelConfig) {
     setConfig(next);
     saved.current[next.model] = next;
@@ -192,6 +334,10 @@ export function Composer({
     }
   }
   async function uploadFiles(files: File[]) {
+    if (onRequireLogin) {
+      onRequireLogin();
+      return;
+    }
     if (uploadingBatch.current || busy || sendingRequest.current) return;
     uploadingBatch.current = true;
     setUploading(true);
@@ -204,6 +350,15 @@ export function Composer({
     }
   }
   async function send() {
+    if (onRequireLogin) {
+      onRequireLogin();
+      return;
+    }
+    if (command) {
+      if (options.length) selectCommand(options[activeIndex]);
+      else setError("请选择匹配项，或按 Esc 关闭快捷选择后再发送");
+      return;
+    }
     if (
       !prompt.trim() ||
       skillUploading ||
@@ -219,6 +374,8 @@ export function Composer({
     const sentAttachments = attachments;
     const sentSkill = selectedSkill;
     setPrompt("");
+    setCaret(0);
+    setDismissed(":0");
     setAttachments([]);
     setSelectedSkill(null);
     setPanel(null);
@@ -242,7 +399,24 @@ export function Composer({
   const nano = config.model === NANO_MODEL;
   const px = dimensions(config);
   return (
-    <div className="composer-wrapper" ref={root}>
+    <div
+      className="composer-wrapper"
+      ref={root}
+      onPointerDownCapture={(e) => {
+        if (onRequireLogin && (e.target as Element).closest("button")) {
+          e.preventDefault();
+          e.stopPropagation();
+          onRequireLogin();
+        }
+      }}
+      onClickCapture={(e) => {
+        if (onRequireLogin && (e.target as Element).closest("button")) {
+          e.preventDefault();
+          e.stopPropagation();
+          onRequireLogin();
+        }
+      }}
+    >
       <div
         className="composer"
         onDragOver={(e) => {
@@ -314,7 +488,6 @@ export function Composer({
           {(projectId || ensureProject) && onAgentSend && mode === "agent" && (
             <SkillPicker
               projectId={projectId}
-              ensureProject={ensureProject}
               selected={selectedSkill}
               onBusy={setSkillUploading}
               onSelect={setSelectedSkill}
@@ -336,20 +509,123 @@ export function Composer({
           ref={textarea}
           aria-label="生图提示词"
           placeholder={
-            projectId
-              ? "今天我们要创作什么"
-              : "描述你的想法，让 AI Canvas 帮你实现…"
+            mode === "agent"
+              ? "描述设计需求，/ 选择 Skill，@ 引用素材"
+              : projectId
+                ? "今天我们要创作什么"
+                : "描述你的想法，让 AI Canvas 帮你实现…"
           }
           value={prompt}
           maxLength={32000}
-          onChange={(e) => setPrompt(e.target.value)}
+          aria-controls={command ? `${commandId}-list` : undefined}
+          aria-haspopup="listbox"
+          aria-activedescendant={
+            command && options.length
+              ? `${commandId}-${activeIndex}`
+              : undefined
+          }
+          onSelect={(e) => setCaret(e.currentTarget.selectionStart)}
+          onChange={(e) => {
+            setPrompt(e.target.value);
+            setCaret(e.target.selectionStart);
+            setActiveOption(0);
+            setDismissed("");
+          }}
           onKeyDown={(e) => {
+            if (e.nativeEvent.isComposing) return;
+            if (command) {
+              if (e.key === "Escape") {
+                e.preventDefault();
+                setDismissed(`${prompt}:${caret}`);
+                return;
+              }
+              if (
+                options.length &&
+                (e.key === "ArrowDown" || e.key === "ArrowUp")
+              ) {
+                e.preventDefault();
+                setActiveOption(
+                  (activeIndex +
+                    (e.key === "ArrowDown" ? 1 : -1) +
+                    options.length) %
+                    options.length,
+                );
+                return;
+              }
+              if (
+                options.length &&
+                ((e.key === "Enter" && !e.ctrlKey && !e.metaKey) ||
+                  (e.key === "Tab" && !e.shiftKey))
+              ) {
+                e.preventDefault();
+                selectCommand(options[activeIndex]);
+                return;
+              }
+            }
             if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
               e.preventDefault();
               void send();
             }
           }}
         />
+        {command && (
+          <div className="composer-command-menu">
+            <div className="composer-command-heading">
+              {command.kind === "skill" ? "选择技能" : "引用项目素材"}
+              <small>↑ ↓ 选择 · Enter 确认 · Esc 关闭</small>
+            </div>
+            {commandLoading ? (
+              <p role="status">正在加载…</p>
+            ) : commandError ? (
+              <p role="alert">{commandError}</p>
+            ) : (
+              <div
+                role="listbox"
+                id={`${commandId}-list`}
+                aria-label={
+                  command.kind === "skill" ? "技能建议" : "参考素材建议"
+                }
+              >
+                {options.map((item, index) => (
+                  <button
+                    type="button"
+                    key={item.id}
+                    role="option"
+                    aria-selected={index === activeIndex}
+                    id={`${commandId}-${index}`}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => selectCommand(item)}
+                  >
+                    {item.asset && (
+                      <span className="command-attachment">
+                        {item.asset.mime === "text/markdown" ? (
+                          <BookOpen aria-hidden="true" size={20} />
+                        ) : (
+                          <img
+                            src={imageDisplayUrl(item.asset.url)}
+                            decoding="async"
+                            alt=""
+                          />
+                        )}
+                      </span>
+                    )}
+                    <span>
+                      <strong>{item.name}</strong>
+                      <small>{item.description}</small>
+                    </span>
+                  </button>
+                ))}
+                {!options.length && (
+                  <p>
+                    {command.kind === "skill"
+                      ? "没有匹配的技能，可从 Skill 按钮上传或前往技能库导入"
+                      : "没有匹配的素材，请先上传图片或 Markdown"}
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+        )}
         <div className="composer-toolbar" ref={toolbar}>
           <div className="composer-options">
             {onAgentSend && (

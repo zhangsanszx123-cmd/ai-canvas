@@ -11,7 +11,12 @@ import sharp from "sharp";
 import { getDb } from "./db";
 import { readAsset, placeAsset } from "./storage";
 import { enqueue, projectFor, transaction } from "./repository";
-import { AGENT_IMAGE_MODEL, generationSchema } from "./models";
+import {
+  AGENT_IMAGE_MODEL,
+  agentImageSizeSchema,
+  agentResolutionForPrompt,
+  generationSchema,
+} from "./models";
 import { HttpError } from "./http";
 import { skillFor } from "./skills";
 
@@ -40,7 +45,7 @@ export async function runAgent(
   if (!process.env.DEEPSEEK_API_KEY)
     throw new HttpError(503, "Agent 密钥尚未配置");
   const acquired = await getDb().query(
-    "UPDATE ac_projects SET agent_lease_until=now()+interval '10 minutes' WHERE id=$1 AND owner_id=$2 AND (agent_lease_until IS NULL OR agent_lease_until<now()) RETURNING agent_messages",
+    "UPDATE ac_projects SET agent_lease_until=now()+interval '10 minutes' WHERE id=$1 AND owner_id=$2 AND deleted_at IS NULL AND (agent_lease_until IS NULL OR agent_lease_until<now()) RETURNING agent_messages",
     [projectId, owner],
   );
   if (!acquired.rowCount) throw new HttpError(409, "Agent 正在处理当前项目");
@@ -120,8 +125,18 @@ export async function runAgent(
             description: "批量构图提示词；一次原子提交最多四张，统一比例和模型",
           },
           referenceAssetIds: { type: "array", items: { type: "string" } },
-          size: { type: "string" },
-          resolution: { type: "string", enum: ["1k", "2k", "4k"] },
+          size: {
+            type: "string",
+            description:
+              "宽高比，例如 1:1、3:2、2:3、16:9、9:16、21:9 或 auto。优先使用比例；兼容 1024x1024 等标准像素尺寸并换算比例。实际清晰度由 resolution 决定。",
+          },
+          resolution: {
+            type: "string",
+            enum: ["1k", "2k", "4k"],
+            default: "1k",
+            description:
+              "默认 1k；仅用户在本轮明确指定 2K 或 4K 时使用更高分辨率，不因像素尺寸或画质描述自行升级。",
+          },
         },
         required: ["prompt"],
       },
@@ -135,10 +150,11 @@ export async function runAgent(
               .max(4)
               .optional(),
             referenceAssetIds: z.array(z.string().uuid()).max(10).default([]),
-            size: z.string().default("1:1"),
+            size: agentImageSizeSchema.default("1:1"),
             resolution: z.enum(["1k", "2k", "4k"]).default("1k"),
           })
           .parse(raw);
+        args.resolution = agentResolutionForPrompt(input.prompt);
         if (args.referenceAssetIds.some((id) => !viewed.has(id)))
           throw new HttpError(422, "请先使用 view_image 查看全部参考图");
         const prompts = args.prompts || [args.prompt];
@@ -180,6 +196,7 @@ export async function runAgent(
           status: tasks[0].status,
           model: AGENT_IMAGE_MODEL,
           referenceAssetIds: args.referenceAssetIds,
+          resolution: args.resolution,
         });
       },
     },

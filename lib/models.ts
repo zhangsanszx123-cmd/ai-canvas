@@ -150,6 +150,46 @@ const pixels: Record<string, [number, number][]> = {
 export function dimensions(c: ModelConfig) {
   return pixels[c.size]?.[["1k", "2k", "4k"].indexOf(c.resolution)] ?? null;
 }
+export const agentImageSizeSchema = z.string().transform((raw, ctx) => {
+  const value = raw
+    .trim()
+    .toLowerCase()
+    .replace(/\s*:\s*/g, ":");
+  const allowed = [...ratios, "2:1", "1:2", "9:21", "auto"];
+  if (allowed.includes(value)) return value;
+  const match = value.match(/^(\d{1,5})\s*[x×]\s*(\d{1,5})$/);
+  if (match) {
+    const width = Number(match[1]),
+      height = Number(match[2]);
+    if (width > 0 && height > 0) {
+      const ratio = allowed.find((candidate) => {
+        const [w, h] = candidate.split(":").map(Number);
+        return width * h === height * w;
+      });
+      if (ratio) return ratio;
+      const preset = Object.entries(pixels).find(([, sizes]) =>
+        sizes.some(([w, h]) => w === width && h === height),
+      );
+      if (preset) return preset[0];
+    }
+  }
+  ctx.addIssue({
+    code: "custom",
+    message:
+      "不支持的图片尺寸，请使用 1:1、16:9、21:9 等比例；像素尺寸须对应支持的比例",
+  });
+  return z.NEVER;
+});
+export function agentResolutionForPrompt(
+  prompt: string,
+): ModelConfig["resolution"] {
+  const requested = prompt.match(/\b[124]\s*k\b/gi);
+  return requested?.length
+    ? (requested[requested.length - 1]
+        .replace(/\s/g, "")
+        .toLowerCase() as ModelConfig["resolution"])
+    : "1k";
+}
 export const activeStates = [
   "submitting",
   "queued",

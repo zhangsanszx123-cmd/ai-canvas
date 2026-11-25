@@ -1,4 +1,5 @@
 "use client";
+import { imageDisplayUrl } from "@/lib/image-display";
 /* eslint-disable @next/next/no-img-element -- Private image URLs require session cookies and must bypass the public optimizer cache. */
 import {
   useCallback,
@@ -35,12 +36,22 @@ import {
   X,
   Minus,
   Trash2,
+  Home,
+  FolderOpen,
 } from "lucide-react";
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+} from "@/components/ui/dropdown-menu";
 import { Composer, ModelIcon } from "./composer";
 import { AgentMessages, useAgentConversation } from "./agent-messages";
 import { Attachment } from "./attachment";
 import { Brand } from "./brand";
 import { ImagePreview } from "./image-preview";
+import { ImageToolbar } from "./image-toolbar";
+import { imageActionLabels, type ImageActionInput } from "@/lib/image-actions";
 import { api, ApiError, type Asset } from "@/lib/client-api";
 import {
   activeStates,
@@ -52,6 +63,12 @@ import {
 type Task = {
   id: string;
   prompt: string;
+  imageAction?: {
+    type: string;
+    label: string;
+    sourceAssetId: string;
+    requestKey?: string;
+  } | null;
   referenceAssetId: string | null;
   referenceAssetIds?: string[];
   attachmentIds?: string[];
@@ -97,6 +114,10 @@ type ImageNode = Node<
     progress: number;
     error: string | null;
     asset: Asset | null;
+    taskId?: string | null;
+    previewUrl?: string | null;
+    actionLabel?: string;
+    optimisticRequestKey?: string;
     onReference: (asset: Asset) => void;
     onPreview: (asset: Asset) => void;
     onDelete: () => Promise<void>;
@@ -131,44 +152,28 @@ function CanvasImage({ data, selected }: NodeProps<ImageNode>) {
         <>
           <img
             className="node-image"
-            src={data.url}
+            src={imageDisplayUrl(data.url)}
+            decoding="async"
             alt="生成图片"
             draggable={false}
           />
-          <div className="node-actions nodrag nopan">
-            <button
-              title="放大图片"
-              aria-label="放大画布图片"
-              onClick={(event) => {
-                event.stopPropagation();
-                if (data.asset) data.onPreview(data.asset);
-              }}
-            >
-              <Expand size={15} />
-            </button>
-            <button
-              title="设为参考图"
-              aria-label="设为参考图"
-              onClick={(e) => {
-                e.stopPropagation();
-                if (data.asset) data.onReference(data.asset);
-              }}
-            >
-              <ImagePlus size={15} />
-            </button>
-            <a
-              aria-label="下载图片"
-              title="下载图片"
-              href={`/api/assets/${data.asset?.id}/content?download=1`}
-            >
-              <Download size={15} />
-            </a>
-          </div>
         </>
       ) : (
         <div
-          className={`generation-placeholder ${data.status === "failed" || data.status === "submission_unknown" ? "generation-failed" : ""}`}
+          className={`generation-placeholder ${data.previewUrl ? "image-action-placeholder" : ""} ${data.status === "failed" || data.status === "submission_unknown" ? "generation-failed" : ""}`}
+          aria-label={
+            data.actionLabel ? `${data.actionLabel}进度` : "图片生成进度"
+          }
         >
+          {data.previewUrl && (
+            <img
+              className="image-action-blur"
+              src={imageDisplayUrl(data.previewUrl)}
+              decoding="async"
+              alt="处理中的原图预览"
+              draggable={false}
+            />
+          )}
           <span>
             {data.status === "failed"
               ? "生成失败"
@@ -176,7 +181,9 @@ function CanvasImage({ data, selected }: NodeProps<ImageNode>) {
                 ? "受理状态待核对"
                 : data.status === "saving"
                   ? "正在保存图片"
-                  : "Generating"}
+                  : data.actionLabel
+                    ? `${data.actionLabel}中`
+                    : "Generating"}
             {!["failed", "submission_unknown"].includes(data.status) && (
               <LoaderCircle size={13} className="spin" />
             )}
@@ -215,6 +222,11 @@ export function Workspace({ projectId }: { projectId: string }) {
   const [fatal, setFatal] = useState(false);
   const [saveState, setSaveState] = useState("已保存");
   const [reference, setReference] = useState<Asset | null>(null);
+  const [actionSubmitting, setActionSubmitting] = useState(false);
+  const actionInFlight = useRef(false);
+  const actionKey = useRef<{ body: string; key: string } | null>(null);
+  const pendingActions = useRef(new Map<string, ImageNode[]>());
+  const mutationVersion = useRef(0);
   const [choosing, setChoosing] = useState(false);
   const [panelWidth, setPanelWidth] = useState(360);
   const [tab, setTab] = useState<"canvas" | "chat">("chat");
@@ -269,8 +281,14 @@ export function Workspace({ projectId }: { projectId: string }) {
   const load = useCallback(async () => {
     if (fetching.current) return;
     fetching.current = true;
+    const readVersion = mutationVersion.current;
     try {
       const data = await api<Snapshot>(`projects/${projectId}`);
+      if (readVersion !== mutationVersion.current) return;
+      for (const key of pendingActions.current.keys()) {
+        if (data.tasks.some((task) => task.imageAction?.requestKey === key))
+          pendingActions.current.delete(key);
+      }
       setSnapshot(data);
       setError("");
       const canSync =
@@ -283,13 +301,16 @@ export function Workspace({ projectId }: { projectId: string }) {
         version.current = data.project.version;
       }
       if (remoteChanged) void flow.current?.setViewport(data.project.viewport);
-      setNodes((old) =>
-        data.nodes
+      setNodes((old) => [
+        ...data.nodes
           .filter((node) => !deletedNodes.current.has(node.id))
-          .map((node) => {
+          .map((node): ImageNode => {
             const existing = old.find((n) => n.id === node.id);
             const preserveSize =
               !canSync && existing?.data.asset?.id === node.asset_id;
+            const action = data.tasks.find(
+              (task) => task.id === node.task_id,
+            )?.imageAction;
             return {
               id: node.id,
               type: "image",
@@ -311,6 +332,11 @@ export function Workspace({ projectId }: { projectId: string }) {
                 progress: node.progress,
                 error: node.error,
                 asset: data.assets.find((a) => a.id === node.asset_id) || null,
+                taskId: node.task_id,
+                previewUrl: action
+                  ? `/api/assets/${action.sourceAssetId}/content`
+                  : null,
+                actionLabel: action?.label,
                 onReference: chooseReference,
                 onPreview: setLightbox,
                 onDelete: () => deleteFailedNode(node.id),
@@ -326,7 +352,8 @@ export function Workspace({ projectId }: { projectId: string }) {
               },
             };
           }),
-      );
+        ...Array.from(pendingActions.current.values()).flat(),
+      ]);
       if (data.tasks.length !== previousTaskCount.current) {
         messages.current?.scrollTo({
           top: messages.current.scrollHeight,
@@ -480,6 +507,196 @@ export function Workspace({ projectId }: { projectId: string }) {
     target.addEventListener("pointerup", end);
     target.addEventListener("pointercancel", end);
   }
+  async function runImageAction(input: ImageActionInput) {
+    if (actionInFlight.current) throw new Error("图片操作正在提交");
+    const source = flow.current
+      ?.getNodes()
+      .find((node) => node.id === input.sourceNodeId);
+    if (!source?.data.asset) throw new Error("请选择可处理的画布图片");
+    const body = JSON.stringify(input);
+    if (actionKey.current?.body !== body)
+      actionKey.current = { body, key: crypto.randomUUID() };
+    const requestKey = actionKey.current.key;
+    actionInFlight.current = true;
+    setActionSubmitting(true);
+    mutationVersion.current++;
+    const label = imageActionLabels[input.action];
+    let pending = pendingActions.current.get(requestKey);
+    if (!pending) {
+      const occupied = (flow.current?.getNodes() || []).map((node) => ({
+        x: node.position.x,
+        y: node.position.y,
+        width: node.width || 480,
+        height: node.height || 320,
+      }));
+      const width = 480,
+        height = (width * source.data.asset.height) / source.data.asset.width;
+      let x = source.position.x + (source.width || 480) + 40;
+      pending = Array.from(
+        { length: input.action === "extract" ? input.elements.length : 1 },
+        (_, index): ImageNode => {
+          let collision;
+          while (
+            (collision = occupied.find(
+              (rect) =>
+                x < rect.x + rect.width + 24 &&
+                x + width + 24 > rect.x &&
+                source.position.y < rect.y + rect.height + 24 &&
+                source.position.y + height + 24 > rect.y,
+            ))
+          )
+            x = collision.x + collision.width + 24;
+          const node: ImageNode = {
+            id: `pending-image-action-${requestKey}-${index}`,
+            type: "image",
+            position: { x, y: source.position.y },
+            width,
+            height,
+            selected: false,
+            draggable: false,
+            data: {
+              ...source.data,
+              url: null,
+              asset: null,
+              taskId: null,
+              status: "submitting",
+              progress: 0,
+              error: null,
+              previewUrl: source.data.url || source.data.asset!.url,
+              actionLabel: label,
+              optimisticRequestKey: requestKey,
+              onDelete: async () => {},
+            },
+          };
+          occupied.push({ x, y: source.position.y, width, height });
+          x += width + 24;
+          return node;
+        },
+      );
+    }
+    pending = pending.map((node) => ({
+      ...node,
+      data: { ...node.data, status: "submitting", error: null },
+    }));
+    pendingActions.current.set(requestKey, pending);
+    setNodes((old) => [
+      ...old.filter((node) => node.data.optimisticRequestKey !== requestKey),
+      ...pending!,
+    ]);
+    const fit = (ids: Set<string>) =>
+      requestAnimationFrame(() =>
+        requestAnimationFrame(() => {
+          const visible = flow.current
+            ?.getNodes()
+            .filter(
+              (node) => node.id === input.sourceNodeId || ids.has(node.id),
+            );
+          if (visible?.length)
+            void flow.current?.fitView({
+              nodes: visible,
+              padding: 0.25,
+              maxZoom: 1,
+            });
+        }),
+      );
+    fit(new Set(pending.map((node) => node.id)));
+    try {
+      const result = await api<{ tasks: Task[]; nodes: ServerNode[] }>(
+        `projects/${projectId}/image-actions`,
+        {
+          method: "POST",
+          headers: { "Idempotency-Key": requestKey },
+          body,
+        },
+      );
+      mutationVersion.current++;
+      pendingActions.current.delete(requestKey);
+      actionKey.current = null;
+      setSnapshot((old) =>
+        old
+          ? {
+              ...old,
+              tasks: [
+                ...old.tasks.filter(
+                  (task) =>
+                    !result.tasks.some((incoming) => incoming.id === task.id),
+                ),
+                ...result.tasks,
+              ],
+              nodes: [
+                ...old.nodes.filter(
+                  (node) =>
+                    !result.nodes.some((incoming) => incoming.id === node.id),
+                ),
+                ...result.nodes,
+              ],
+            }
+          : old,
+      );
+      setNodes((old) => {
+        const retained = old.filter(
+          (node) =>
+            node.data.optimisticRequestKey !== requestKey &&
+            !result.nodes.some((incoming) => incoming.id === node.id),
+        );
+        const confirmed: ImageNode[] = result.nodes.map((node) => ({
+          id: node.id,
+          type: "image",
+          position: { x: node.x, y: node.y },
+          width: node.width,
+          height: node.height,
+          data: {
+            ...source.data,
+            url: node.url,
+            asset: null,
+            taskId: node.task_id,
+            status: node.status,
+            progress: node.progress,
+            error: node.error,
+            previewUrl: source.data.url || source.data.asset!.url,
+            actionLabel: label,
+            optimisticRequestKey: undefined,
+            onDelete: () => deleteFailedNode(node.id),
+          },
+        }));
+        return [...retained, ...confirmed];
+      });
+      fit(new Set(result.nodes.map((node) => node.id)));
+      void load();
+    } catch (error) {
+      mutationVersion.current++;
+      if (
+        error instanceof ApiError &&
+        error.status >= 400 &&
+        error.status < 500
+      ) {
+        pendingActions.current.delete(requestKey);
+        setNodes((old) =>
+          old.filter((node) => node.data.optimisticRequestKey !== requestKey),
+        );
+      } else {
+        const uncertain = pending!.map((node) => ({
+          ...node,
+          data: {
+            ...node.data,
+            status: "submission_unknown",
+            error: "正在核对提交状态，可用相同操作重试",
+          },
+        }));
+        pendingActions.current.set(requestKey, uncertain);
+        setNodes((old) => [
+          ...old.filter(
+            (node) => node.data.optimisticRequestKey !== requestKey,
+          ),
+          ...uncertain,
+        ]);
+      }
+      throw error;
+    } finally {
+      actionInFlight.current = false;
+      setActionSubmitting(false);
+    }
+  }
   async function send(input: GenerationInput) {
     const body = JSON.stringify(input);
     if (sendKey.current?.body !== body)
@@ -542,12 +759,16 @@ export function Workspace({ projectId }: { projectId: string }) {
       </main>
     );
   const busy =
+    actionSubmitting ||
     agent.busy ||
     !agent.ready ||
     (snapshot.project.agent_lease_until
       ? Date.parse(snapshot.project.agent_lease_until) > Date.now()
       : false) ||
     snapshot.tasks.some((t) => activeStates.includes(t.status));
+  const selection = nodes.filter((node) => node.selected);
+  const selectedImage =
+    selection.length === 1 && selection[0].data.asset ? selection[0] : null;
   return (
     <main
       className="workspace"
@@ -673,17 +894,63 @@ export function Workspace({ projectId }: { projectId: string }) {
             if (event) scheduleSave();
           }}
           onNodeClick={(_, node) => {
-            if (node.data.asset) chooseReference(node.data.asset);
+            if (!node.data.asset) return;
+            if (choosing) chooseReference(node.data.asset);
+            else if (node.data.asset.bytes <= 10000000)
+              setReference({ ...node.data.asset });
           }}
           onNodeDoubleClick={(_, node) => {
             if (node.data.asset && !choosing) setLightbox(node.data.asset);
           }}
           deleteKeyCode={null}
-        ></ReactFlow>
+        >
+          {selectedImage && (
+            <ImageToolbar
+              key={selectedImage.id}
+              node={selectedImage}
+              asset={selectedImage.data.asset!}
+              sourcePrompt={
+                snapshot.tasks.find(
+                  (task) => task.id === selectedImage.data.taskId,
+                )?.prompt
+              }
+              busy={busy}
+              onRun={runImageAction}
+              onReference={() => chooseReference(selectedImage.data.asset!)}
+              onPreview={() => setLightbox(selectedImage.data.asset!)}
+              onDelete={() => {
+                void deleteFailedNode(selectedImage.id);
+              }}
+            />
+          )}
+        </ReactFlow>
         <header className="canvas-header">
-          <Link href="/protected" title="返回首页">
-            <Brand compact />
-          </Link>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                className="canvas-menu-trigger"
+                aria-label="画布菜单"
+                title="画布菜单"
+              >
+                <Brand compact />
+                <ChevronDown size={12} />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start" sideOffset={8}>
+              <DropdownMenuItem asChild>
+                <Link href="/">
+                  <Home size={15} />
+                  返回首页
+                </Link>
+              </DropdownMenuItem>
+              <DropdownMenuItem asChild>
+                <Link href="/projects">
+                  <FolderOpen size={15} />
+                  项目库
+                </Link>
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
           <button className="project-title" onClick={() => void rename()}>
             {snapshot.project.name}
             <ChevronDown size={12} />
@@ -849,6 +1116,11 @@ export function Workspace({ projectId }: { projectId: string }) {
               const task = entry.task;
               return (
                 <article className="generation-message" key={task.id}>
+                  {task.imageAction && (
+                    <div className="image-action-task-label">
+                      图片处理 · {task.imageAction.label}
+                    </div>
+                  )}
                   {task.config.model !== "gpt-image-2.5-sunburst" && (
                     <div className="agent-user-message">
                       {(task.attachmentIds?.length
@@ -921,7 +1193,11 @@ export function Workspace({ projectId }: { projectId: string }) {
                             }
                           }}
                         >
-                          <img src={result.url} alt="生成结果" />
+                          <img
+                            src={imageDisplayUrl(result.url)}
+                            decoding="async"
+                            alt="生成结果"
+                          />
                         </button>
                         <div className="message-actions">
                           <button
@@ -1019,6 +1295,7 @@ export function Workspace({ projectId }: { projectId: string }) {
             projectId={projectId}
             initialConfig={snapshot.project.config}
             selectedReference={reference}
+            availableAssets={snapshot.assets}
             busy={busy}
             onChooseCanvas={() => {
               if (!nodes.some((node) => node.data.asset)) {

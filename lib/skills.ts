@@ -35,7 +35,7 @@ export function parseSkill(source: string) {
 }
 export async function skillFor(owner: string, project: string, id: string) {
   const { rows } = await getDb().query(
-    "SELECT id,name,description,body,source FROM ac_skills WHERE id=$1 AND owner_id=$2 AND project_id=$3",
+    "SELECT id,name,description,body,source FROM ac_skills WHERE id=$1 AND owner_id=$2 AND (project_id=$3 OR project_id IS NULL)",
     [id, owner, project],
   );
   if (!rows[0]) throw new HttpError(404, "技能不存在或已移除");
@@ -46,4 +46,21 @@ export async function skillFor(owner: string, project: string, id: string) {
     body: string;
     source: string;
   };
+}
+
+export async function skillUpload(request: Request) {
+  const form = await request.formData();
+  const file = form.get("file");
+  if (!(file instanceof File) || !/^SKILL\.md$/i.test(file.name))
+    throw new HttpError(422, "请上传标准 SKILL.md 文件");
+  if (file.size > 128000) throw new HttpError(413, "Skill 不能超过 128KB");
+  let source: string;
+  try {
+    source = new TextDecoder("utf-8", { fatal: true }).decode(
+      await file.arrayBuffer(),
+    );
+  } catch {
+    throw new HttpError(422, "Skill 必须为 UTF-8 编码");
+  }
+  return parseSkill(source);
 }

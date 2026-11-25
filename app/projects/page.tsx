@@ -1,15 +1,16 @@
-import { pageUser } from "@/lib/session";
+import { headers } from "next/headers";
+import { auth } from "@/lib/auth";
 import { AppHeader } from "@/components/canvas/app-header";
 import { ProjectGrid } from "@/components/canvas/project-grid";
 import { Suspense } from "react";
 import { RouteLoading } from "@/components/canvas/route-loading";
 async function ProjectsContent() {
-  const user = await pageUser();
+  const session = await auth.api.getSession({ headers: await headers() });
   return (
     <main className="app-shell">
-      <AppHeader name={user.name} />
+      <AppHeader name={session?.user.name} />
       <div className="all-projects">
-        <ProjectGrid />
+        <ProjectGrid publicView={!session} />
       </div>
     </main>
   );

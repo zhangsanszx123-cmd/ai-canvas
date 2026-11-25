@@ -5,11 +5,19 @@ import { Brand } from "./brand";
 import { ProjectGrid } from "./project-grid";
 import { api, type Asset, type Skill } from "@/lib/client-api";
 import type { GenerationInput } from "@/lib/models";
-export function CreativeHome() {
+export function CreativeHome({
+  authenticated = true,
+}: {
+  authenticated?: boolean;
+}) {
   const pending = useRef<{ payload: string; key: string } | null>(null);
   const projectRequest = useRef<Promise<string> | null>(null);
   const [projectId, setProjectId] = useState<string>();
   function ensureProject() {
+    if (!authenticated) {
+      window.location.assign("/auth/login");
+      return Promise.reject(new Error("请先登录后创作"));
+    }
     if (!projectRequest.current)
       projectRequest.current = api<{ id: string }>("projects", {
         method: "POST",
@@ -75,7 +83,7 @@ export function CreativeHome() {
         </div>
         <span className="keyboard-hint">⌘ / Ctrl + Enter 发送</span>
       </section>
-      <ProjectGrid recent />
+      <ProjectGrid recent publicView={!authenticated} />
     </>
   );
 }

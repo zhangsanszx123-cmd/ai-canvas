@@ -5,6 +5,7 @@ import { useSearchParams } from "next/navigation";
 import { LoaderCircle, ArrowLeft } from "lucide-react";
 import { authClient } from "@/lib/auth-client";
 import { Brand } from "./brand";
+import { authReturnPath } from "@/lib/auth-return";
 export function AuthForm({
   mode,
   mailConfigured,
@@ -37,7 +38,7 @@ export function AuthForm({
               email,
               password,
               name,
-              callbackURL: "/protected",
+              callbackURL: authReturnPath(params.get("next")),
             })
           : mode === "login"
             ? await authClient.signIn.email({ email, password })
@@ -59,7 +60,7 @@ export function AuthForm({
         return;
       }
       if (mode === "login" || mode === "signup") {
-        window.location.assign("/protected");
+        window.location.assign(authReturnPath(params.get("next")));
         return;
       }
       setMessage(
@@ -165,10 +166,24 @@ export function AuthForm({
           {mode === "login" ? (
             <>
               <Link href="/auth/forgot-password">忘记密码？</Link>
-              <Link href="/auth/sign-up">注册新账号</Link>
+              <Link
+                href={
+                  params.get("next")
+                    ? `/auth/sign-up?next=${encodeURIComponent(authReturnPath(params.get("next")))}`
+                    : "/auth/sign-up"
+                }
+              >
+                注册新账号
+              </Link>
             </>
           ) : (
-            <Link href="/auth/login">
+            <Link
+              href={
+                params.get("next")
+                  ? `/auth/login?next=${encodeURIComponent(authReturnPath(params.get("next")))}`
+                  : "/auth/login"
+              }
+            >
               <ArrowLeft size={14} />
               返回登录
             </Link>

@@ -1,5 +1,10 @@
 "use client";
-export type Skill = { id: string; name: string; description: string };
+export type Skill = {
+  id: string;
+  name: string;
+  description: string;
+  scope?: "account" | "project";
+};
 export class ApiError extends Error {
   constructor(
     message: string,

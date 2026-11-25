@@ -1,26 +1,42 @@
 import { redirect, notFound } from "next/navigation";
-import { pageUser } from "@/lib/session";
+import { headers } from "next/headers";
+import { auth } from "@/lib/auth";
 import { projectFor } from "@/lib/repository";
 import { Workspace } from "@/components/canvas/workspace";
 import { HttpError, uuid } from "@/lib/http";
 import { Suspense } from "react";
 import { RouteLoading } from "@/components/canvas/route-loading";
+import { publicProject } from "@/lib/public-projects";
+import { PublicWorkspace } from "@/components/canvas/public-workspace";
 type CanvasPageProps = { searchParams: Promise<{ projectId?: string }> };
 async function CanvasContent({
   searchParams,
 }: {
   searchParams: Promise<{ projectId?: string }>;
 }) {
-  const user = await pageUser();
+  const session = await auth.api.getSession({ headers: await headers() });
   const { projectId } = await searchParams;
   if (!projectId) redirect("/projects");
   try {
-    await projectFor(user.id, uuid(projectId));
+    uuid(projectId);
+    if (session) {
+      try {
+        await projectFor(session.user.id, projectId);
+        return <Workspace projectId={projectId} />;
+      } catch (e) {
+        if (!(e instanceof HttpError && e.status === 404)) throw e;
+      }
+    }
+    return (
+      <PublicWorkspace
+        data={await publicProject(projectId)}
+        authenticated={Boolean(session)}
+      />
+    );
   } catch (e) {
     if (e instanceof HttpError && e.status === 404) notFound();
     throw e;
   }
-  return <Workspace projectId={projectId} />;
 }
 export default function CanvasPage({ searchParams }: CanvasPageProps) {
   return (

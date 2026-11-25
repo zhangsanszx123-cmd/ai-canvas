@@ -12,6 +12,7 @@ import { HttpError } from "./http";
 
 export const MAX_IMAGE_BYTES = 10_000_000;
 let s3: S3Client | undefined;
+const previewSignatures = new Map<string, { url: string; until: number }>();
 function client() {
   if (
     !process.env.S3_ENDPOINT ||
@@ -70,17 +71,22 @@ export async function putAsset(
   );
   const id = crypto.randomUUID();
   const key = `${owner}/${project || "pending"}/${id}.${info.ext}`;
-  await client().send(
-    new PutObjectCommand({
-      Bucket: process.env.S3_BUCKET,
-      Key: key,
-      Body: bytes,
-      ContentType: info.mime,
-    }),
-  );
+  const previewKey = `${key}.preview.webp`;
+  const preview = await createImagePreview(bytes);
+  try {
+    const uploads = await Promise.allSettled([
+      uploadImage(key, bytes, info.mime),
+      uploadImage(previewKey, preview, "image/webp"),
+    ]);
+    const failed = uploads.find((result) => result.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
+  } catch (error) {
+    await deleteObject(key).catch(() => {});
+    throw error;
+  }
   try {
     await getDb().query(
-      "INSERT INTO ac_assets(id,owner_id,project_id,object_key,mime,width,height,bytes,source) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+      "INSERT INTO ac_assets(id,owner_id,project_id,object_key,mime,width,height,bytes,source,preview_object_key) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
       [
         id,
         owner,
@@ -91,6 +97,7 @@ export async function putAsset(
         info.height,
         bytes.length,
         source,
+        previewKey,
       ],
     );
   } catch (e) {
@@ -100,12 +107,19 @@ export async function putAsset(
   return { id, ...info, bytes: bytes.length, url: await signKey(key) };
 }
 export async function signKey(key: string, expiresIn = 3600, download = false) {
+  // Reuse preview signatures briefly so repeated views can use the browser's
+  // image cache. Callers still recheck authorization before every redirect.
+  const cacheKey = `${expiresIn}:${key}`;
+  const cacheable =
+    key.endsWith(".preview.webp") && !download && expiresIn >= 120;
+  const cached = cacheable ? previewSignatures.get(cacheKey) : undefined;
+  if (cached && cached.until > Date.now()) return cached.url;
   const ext =
     key
       .split(".")
       .at(-1)
       ?.replace(/[^a-z]/g, "") || "png";
-  return getSignedUrl(
+  const url = await getSignedUrl(
     client(),
     new GetObjectCommand({
       Bucket: process.env.S3_BUCKET,
@@ -118,29 +132,52 @@ export async function signKey(key: string, expiresIn = 3600, download = false) {
     }),
     { expiresIn },
   );
+  if (cacheable) {
+    if (previewSignatures.size >= 500)
+      previewSignatures.delete(previewSignatures.keys().next().value!);
+    previewSignatures.set(cacheKey, { url, until: Date.now() + 60_000 });
+  }
+  return url;
 }
 export async function assetUrl(
   id: string,
   owner: string,
   expiresIn = 3600,
   download = false,
+  preview = false,
 ) {
   const { rows } = await getDb().query(
-    "SELECT object_key FROM ac_assets WHERE id=$1 AND owner_id=$2",
+    "SELECT a.object_key,a.preview_object_key FROM ac_assets a WHERE a.id=$1 AND a.owner_id=$2 AND (a.project_id IS NULL OR EXISTS(SELECT 1 FROM ac_projects p WHERE p.id=a.project_id AND p.owner_id=$2 AND p.deleted_at IS NULL))",
     [id, owner],
   );
   if (!rows[0]) throw new HttpError(404, "图片不存在");
-  return signKey(rows[0].object_key, expiresIn, download);
+  return signKey(
+    preview && !download
+      ? rows[0].preview_object_key || rows[0].object_key
+      : rows[0].object_key,
+    expiresIn,
+    download,
+  );
 }
 export async function deleteObject(key: string) {
-  return client().send(
-    new DeleteObjectCommand({ Bucket: process.env.S3_BUCKET, Key: key }),
+  return Promise.all(
+    [
+      key,
+      ...(/\.(png|jpeg|webp)$/.test(key) ? [`${key}.preview.webp`] : []),
+    ].map((objectKey) =>
+      client().send(
+        new DeleteObjectCommand({
+          Bucket: process.env.S3_BUCKET,
+          Key: objectKey,
+        }),
+      ),
+    ),
   );
 }
 
 export async function readAsset(id: string, owner: string, project: string) {
   const { rows } = await getDb().query(
-    "SELECT * FROM ac_assets WHERE id=$1 AND owner_id=$2 AND project_id=$3",
+    "SELECT a.* FROM ac_assets a JOIN ac_projects p ON p.id=a.project_id WHERE a.id=$1 AND a.owner_id=$2 AND a.project_id=$3 AND p.owner_id=$2 AND p.deleted_at IS NULL",
     [id, owner, project],
   );
   const asset = rows[0];
@@ -210,7 +247,7 @@ export async function placeAsset(
   y?: number,
 ) {
   const { rows } = await getDb().query(
-    "SELECT a.width,a.height FROM ac_assets a JOIN ac_projects p ON p.id=a.project_id WHERE a.id=$1 AND a.owner_id=$2 AND a.project_id=$3 AND p.owner_id=$2 AND a.mime LIKE 'image/%'",
+    "SELECT a.width,a.height FROM ac_assets a JOIN ac_projects p ON p.id=a.project_id WHERE a.id=$1 AND a.owner_id=$2 AND a.project_id=$3 AND p.owner_id=$2 AND p.deleted_at IS NULL AND a.mime LIKE 'image/%'",
     [assetId, owner, project],
   );
   if (!rows[0]) throw new HttpError(404, "图片不存在");
@@ -237,4 +274,54 @@ export async function placeAsset(
     ],
   );
   return { id, assetId };
+}
+
+export async function createImagePreview(bytes: Buffer) {
+  return sharp(bytes, { limitInputPixels: 100_000_000 })
+    .rotate()
+    .resize({
+      width: 1024,
+      height: 1024,
+      fit: "inside",
+      withoutEnlargement: true,
+    })
+    .webp({ quality: 78 })
+    .toBuffer();
+}
+async function uploadImage(key: string, bytes: Buffer, mime: string) {
+  await client().send(
+    new PutObjectCommand({
+      Bucket: process.env.S3_BUCKET,
+      Key: key,
+      Body: bytes,
+      ContentType: mime,
+      CacheControl: "private, max-age=86400, immutable",
+    }),
+  );
+}
+
+// Backfill only derived files; original objects and canvas geometry are untouched.
+export async function backfillImagePreview(id: string) {
+  const { rows } = await getDb().query(
+    "SELECT object_key,preview_object_key FROM ac_assets WHERE id=$1 AND mime IN ('image/png','image/jpeg','image/webp')",
+    [id],
+  );
+  const asset = rows[0];
+  if (!asset || asset.preview_object_key) return null;
+  const object = await client().send(
+    new GetObjectCommand({
+      Bucket: process.env.S3_BUCKET,
+      Key: asset.object_key,
+    }),
+  );
+  if (!object.Body) throw new Error("图片不可读");
+  const bytes = Buffer.from(await object.Body.transformToByteArray());
+  const preview = await createImagePreview(bytes);
+  const key = `${asset.object_key}.preview.webp`;
+  await uploadImage(key, preview, "image/webp");
+  await getDb().query(
+    "UPDATE ac_assets SET preview_object_key=$2 WHERE id=$1 AND object_key=$3 AND preview_object_key IS NULL",
+    [id, key, asset.object_key],
+  );
+  return { originalBytes: bytes.length, previewBytes: preview.length };
 }
