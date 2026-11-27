@@ -1,0 +1,46 @@
+name: ai-canvas
+x-runtime: &runtime
+  image: ${APP_IMAGE:?Set APP_IMAGE to a verified immutable image reference}
+  restart: unless-stopped
+  init: true
+  env_file:
+    - path: ./deploy/runtime.env
+      format: raw
+  environment:
+    APP_URL: http://43.143.85.207:8082
+    DB_CA_CERT: /run/secrets/postgres-ca.pem
+    DB_TLS_SERVERNAME: 43.143.85.207
+  volumes:
+    - type: bind
+      source: ./deploy/secrets/postgres-ca.pem
+      target: /run/secrets/postgres-ca.pem
+      read_only: true
+      bind:
+        create_host_path: false
+  networks: [shared]
+  mem_limit: 1g
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+  stop_grace_period: 30s
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: '3'
+services:
+  app:
+    <<: *runtime
+    ports: ['127.0.0.1:13002:3000']
+  worker:
+    <<: *runtime
+    command: ['node', '--conditions=react-server', 'worker.mjs']
+    healthcheck:
+      test: ['CMD', 'node', '--conditions=react-server', '-e', 'const fs=require("node:fs"); const {Pool}=require("pg"); const u=new URL(process.env.DATABASE_URL); ["sslmode","sslcert","sslkey","sslrootcert"].forEach(k=>u.searchParams.delete(k)); const p=new Pool({connectionString:u.toString(),ssl:{ca:fs.readFileSync(process.env.DB_CA_CERT),rejectUnauthorized:true,checkServerIdentity:(_,cert)=>require("node:tls").checkServerIdentity(process.env.DB_TLS_SERVERNAME,cert)},connectionTimeoutMillis:5000}); p.query("SELECT 1 FROM pg_locks WHERE locktype=$$$$advisory$$$$ AND objid=(hashtext($$$$ai-canvas-worker$$$$)::bigint & 4294967295) AND granted").then(r=>{process.exitCode=r.rowCount?0:1}).catch(()=>{process.exitCode=1}).finally(()=>p.end())']
+      interval: 30s
+      timeout: 10s
+      start_period: 40s
+      retries: 3
+networks:
+  shared:
+    external: true
+    name: 1panel-network

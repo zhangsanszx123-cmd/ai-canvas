@@ -42,3 +42,14 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Local deployment state and private runtime configuration
+/deploy/runtime.env
+/deploy/secrets/
+/deploy/releases/
+/deploy/current-image*
+/deploy/previous-image
+/deploy/.*.lock
+/deploy/__pycache__/
+/release-image/
+/dist/

@@ -2,6 +2,7 @@ import "server-only";
 
 import { Pool } from "pg";
 import { readFileSync } from "node:fs";
+import { checkServerIdentity } from "node:tls";
 
 const globalForDb = globalThis as typeof globalThis & {
   databasePool?: Pool;
@@ -16,6 +17,7 @@ function createPool() {
 
   const url = new URL(connectionString);
   const caPath = process.env.DB_CA_CERT;
+  const tlsServerName = process.env.DB_TLS_SERVERNAME;
   if (caPath) {
     for (const key of ["sslmode", "sslcert", "sslkey", "sslrootcert"])
       url.searchParams.delete(key);
@@ -23,7 +25,20 @@ function createPool() {
   const pool = new Pool({
     connectionString: url.toString(),
     ...(caPath
-      ? { ssl: { ca: readFileSync(caPath, "utf8"), rejectUnauthorized: true } }
+      ? {
+          ssl: {
+            ca: readFileSync(caPath, "utf8"),
+            rejectUnauthorized: true,
+            ...(tlsServerName
+              ? {
+                  checkServerIdentity: (
+                    _host: string,
+                    cert: Parameters<typeof checkServerIdentity>[1],
+                  ) => checkServerIdentity(tlsServerName, cert),
+                }
+              : {}),
+          },
+        }
       : {}),
     max: 10,
     connectionTimeoutMillis: 10_000,

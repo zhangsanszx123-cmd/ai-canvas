@@ -1,5 +1,11 @@
 # 环境变量与配置检查
 
+## 生产数据库 TLS 身份
+
+生产容器通过 Docker 网络内的 `postgresql` 别名连接数据库，证书 SAN 为服务器公网 IP。`DB_CA_CERT` 指定只读挂载的 CA；`DB_TLS_SERVERNAME` 指定需要验证的证书身份。连接始终保留证书链校验，并使用 Node TLS 的 `checkServerIdentity` 校验该身份，不关闭证书验证。未设置 `DB_TLS_SERVERNAME` 时沿用驱动默认身份校验。
+
+生产配置保存于服务器 `/opt/projects/ai-canvas/deploy/runtime.env`，权限为 600。生产使用独立受限数据库账号，本地 `.env` 保持原值。部署记录和完整操作说明见 [生产部署](production-deployment.md)。
+
 ## 检查结果
 
 本次只检查变量名及是否有值，不记录实际值。最新读取的 `.env` 已包含数据库、S3 和 ToAPIs 必需配置；`.env.local` 的两个旧 Supabase 变量为空。此前“S3 尚未读到”的检查结果已被本次检查更新，配置存在不等于接口已联调成功。

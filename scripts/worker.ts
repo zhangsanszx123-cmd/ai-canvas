@@ -43,4 +43,8 @@ async function main() {
   lock.release();
   await getDb().end();
 }
-void main();
+if (process.argv.includes("--check")) {
+  console.log("Worker modules loaded");
+} else {
+  void main();
+}

@@ -1,5 +1,9 @@
 # 运行与维护
 
+## Docker 生产环境
+
+2026-11-27 已部署到 `http://43.143.85.207:8082/`。生产通过 GitHub `main` 分支构建镜像、SSH 直传和 Compose 管理网页及 worker，不使用本地开发启动方式。参数、验证记录、配置更新及回滚说明见 [生产部署](production-deployment.md)。数据库迁移由操作人员审阅后使用独立运维凭据执行，运行账号不拥有 DDL 权限。
+
 ## 进程和迁移
 
 - 依赖安装沿用 `pnpm install`，新增依赖使用 `pnpm add`；已加入 `@earendil-works/pi-ai`、`@earendil-works/pi-agent-core` 1.6.x，已接入右侧统一对话、服务端工具和流式事件。两包要求 Node.js >=22.19.0，本地当前 Node.js 24.18.0。`lucide-react` 已升级至 1.x，满足 `@lobehub/icons` 的 peer 版本要求；pnpm 和现存 npm 锁文件同步更新。
